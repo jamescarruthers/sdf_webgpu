@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebGPU Dynamic SDF Renderer</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #000;
+        color: #cde;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        overflow: hidden;
+        height: 100%;
+      }
+      #canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        cursor: crosshair;
+      }
+      #hud {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        padding: 8px 10px;
+        background: rgba(0, 0, 0, 0.55);
+        border: 1px solid #234;
+        border-radius: 4px;
+        font-size: 12px;
+        line-height: 1.4;
+        pointer-events: none;
+        white-space: pre;
+        min-width: 220px;
+      }
+      #error {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: rgba(0, 0, 0, 0.85);
+        color: #f99;
+        font-size: 14px;
+        text-align: center;
+        white-space: pre-wrap;
+        pointer-events: auto;
+      }
+      #help {
+        position: fixed;
+        bottom: 8px;
+        left: 8px;
+        padding: 6px 8px;
+        background: rgba(0, 0, 0, 0.55);
+        border: 1px solid #234;
+        border-radius: 4px;
+        font-size: 11px;
+        color: #9ab;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="hud">booting…</div>
+    <div id="help">WASD move · Space/Ctrl up/down · Shift fast · click canvas then drag to look · 1/2/3 debug · M toggle atlas</div>
+    <div id="error"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

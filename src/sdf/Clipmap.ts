@@ -301,14 +301,18 @@ export class Clipmap {
     }
   }
 
-  /** Pop up to `maxBricks` queued evaluations and bake them into the atlas.
+  /** Pop queued evaluations and bake them into the atlas until either
+   *  `maxBricks` entries have been processed or `maxMs` wall time has
+   *  elapsed (whichever comes first). A 0 for either limit disables it.
    *  Returns the number of bricks processed. */
-  flush(records: readonly Record8[], maxBricks: number): number {
+  flush(records: readonly Record8[], maxBricks: number, maxMs = 0): number {
     const sampleSpacingBase = this.config.baseBrickWorld / (BRICK_SAMPLES - 1);
     const samples = new Float32Array(BRICK_SAMPLES * BRICK_SAMPLES * BRICK_SAMPLES);
     let processed = 0;
+    const deadline = maxMs > 0 ? performance.now() + maxMs : Infinity;
 
-    while (processed < maxBricks && this.queue.length > 0) {
+    while ((maxBricks <= 0 || processed < maxBricks) && this.queue.length > 0) {
+      if (processed > 0 && maxMs > 0 && performance.now() >= deadline) break;
       const e = this.queue.shift()!;
       this.queuedSet.delete(this.encodeQueueKey(e.level, e.ringLinear));
       const L = this.levels[e.level]!;

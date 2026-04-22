@@ -76,8 +76,10 @@ export class Engine {
 
   // Per-frame streaming budget.
   perFrameBrickBudget = 512;
+  perFrameStreamMs = 4;
   lastBakeMs = 0;
   lastStreamedBricks = 0;
+  renderScale = 1.0;
 
   private mode: RenderMode = "clipmap";
   private maxSteps = 160;
@@ -472,8 +474,12 @@ export class Engine {
     this.gpu.device.queue.writeBuffer(this.uniformBuffer, 0, data);
   }
 
+  setRenderScale(scale: number): void {
+    this.renderScale = Math.max(0.1, Math.min(2, scale));
+  }
+
   update(input: Input, dt: number): void {
-    resizeCanvas(this.gpu.canvas);
+    resizeCanvas(this.gpu.canvas, this.renderScale);
     this.camera.update(input, dt);
     const d = input.debug;
     this.debugMode = d === "steps" ? 1 : d === "normals" ? 2 : 0;
@@ -481,7 +487,11 @@ export class Engine {
     if (this.mode === "clipmap" && this.clipmap) {
       const t0 = performance.now();
       this.clipmap.recenter(this.camera.position);
-      this.lastStreamedBricks = this.clipmap.flush(this.sceneRecords, this.perFrameBrickBudget);
+      this.lastStreamedBricks = this.clipmap.flush(
+        this.sceneRecords,
+        this.perFrameBrickBudget,
+        this.perFrameStreamMs,
+      );
       this.uploadClipmapDiffs();
       this.lastBakeMs = performance.now() - t0;
     }

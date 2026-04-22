@@ -34,10 +34,11 @@ export async function requestGPU(canvas: HTMLCanvasElement): Promise<GPUContext>
   return { adapter, device, canvas, context, format };
 }
 
-export function resizeCanvas(canvas: HTMLCanvasElement): boolean {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
-  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+export function resizeCanvas(canvas: HTMLCanvasElement, renderScale = 1.0): boolean {
+  const dprBase = Math.min(window.devicePixelRatio || 1, 2);
+  const scale = Math.max(0.1, Math.min(2, renderScale));
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dprBase * scale));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dprBase * scale));
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
     canvas.height = h;

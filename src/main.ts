@@ -1,7 +1,7 @@
 import { Clock } from "./engine/Clock";
 import { createEngine, type RenderMode } from "./engine/Engine";
 import { Input } from "./engine/Input";
-import { demoScene, spherePhase1 } from "./sdf/Scene";
+import { demoScene, largeScene, spherePhase1 } from "./sdf/Scene";
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 const hud = document.getElementById("hud") as HTMLDivElement;
@@ -27,26 +27,25 @@ async function boot(): Promise<void> {
   const clock = new Clock();
 
   const url = new URL(window.location.href);
-  const sceneName = url.searchParams.get("scene") ?? "demo";
-  const scene = sceneName === "sphere" ? spherePhase1() : demoScene();
+  const sceneName = url.searchParams.get("scene") ?? "large";
+  const scene =
+    sceneName === "sphere" ? spherePhase1() :
+    sceneName === "demo" ? demoScene() :
+    largeScene();
   engine.setScene(scene);
 
-  // M toggles render mode between analytic and atlas. First toggle lazily
-  // bakes the atlas so we don't pay the cost at boot unless the user wants it.
-  let mode: RenderMode = "analytic";
-  let bakeMs = 0;
+  // Default to the geometry-clipmap render path so the scene streams around
+  // the camera. Press M to fall back to the analytic fragment shader for
+  // comparison.
+  engine.initClipmap();
+  engine.warmClipmap(80);
+  engine.setMode("clipmap");
+
+  let mode: RenderMode = "clipmap";
   window.addEventListener("keydown", (e) => {
     if (e.code === "KeyM") {
-      if (mode === "analytic") {
-        const t0 = performance.now();
-        engine!.bakeAtlas(scene.getRecords());
-        bakeMs = performance.now() - t0;
-        engine!.setMode("atlas");
-        mode = "atlas";
-      } else {
-        engine!.setMode("analytic");
-        mode = "analytic";
-      }
+      mode = mode === "clipmap" ? "analytic" : "clipmap";
+      engine!.setMode(mode);
     }
   });
 
@@ -56,18 +55,20 @@ async function boot(): Promise<void> {
 
   const hudUpdate = () => {
     const s = engine!.stats();
-    const atlasLine =
-      s.mode === "atlas"
-        ? `\natlas  ${s.atlasAllocated}/${s.atlasCapacity} slots   bake ${bakeMs.toFixed(1)} ms`
-        : "\npress M to toggle brick atlas";
+    const clipmapLine =
+      s.mode === "clipmap"
+        ? `\nclipmap  ${s.clipmapAllocated}/${s.clipmapCapacity} slots · queue ${s.clipmapQueueDepth}` +
+          `\n  per-level  ${s.clipmapLevelCounts.join(" / ")}` +
+          `\n  stream ${s.lastBakeMs.toFixed(1)} ms/frame`
+        : "\npress M to return to clipmap";
     hud.textContent =
       `WebGPU SDF  ${s.resolution[0]}×${s.resolution[1]}\n` +
       `fps  ${clock.fps.toFixed(1)}   frame  ${clock.frameMs.toFixed(2)} ms\n` +
       `mode  ${s.mode}\n` +
-      `scene records  ${s.sceneRecords}\n` +
+      `scene  ${sceneName}   records ${s.sceneRecords}\n` +
       `debug  ${s.debugMode}   (1=steps, 2=normals, 3=off)\n` +
       `cam  ${engine!.camera.position.map((v) => v.toFixed(1)).join(", ")}` +
-      atlasLine;
+      clipmapLine;
   };
 
   const frame = () => {

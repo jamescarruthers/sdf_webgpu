@@ -1,14 +1,13 @@
 import { requestGPU, resizeCanvas, type GPUContext } from "../util/gpu";
 import { RECORD_BYTES, type SceneBuilder, type Record8 } from "../sdf/Primitives";
-import { BrickAtlas, BRICK_SAMPLES, SAMPLE_SPACING } from "../sdf/BrickAtlas";
-import type { Vec3 } from "../util/math";
+import { BRICK_SAMPLES, Clipmap, type ClipmapConfig } from "../sdf/Clipmap";
 import uniformsSrc from "../shaders/common/uniforms.wgsl?raw";
 import sdfOpsSrc from "../shaders/common/sdf_ops.wgsl?raw";
 import sceneSrc from "../shaders/common/scene.wgsl?raw";
-import brickSrc from "../shaders/common/brick.wgsl?raw";
+import clipmapSrc from "../shaders/common/clipmap.wgsl?raw";
 import sharedSrc from "../shaders/common/shared.wgsl?raw";
 import raymarchAnalyticSrc from "../shaders/raymarch.wgsl?raw";
-import raymarchAtlasSrc from "../shaders/raymarch_atlas.wgsl?raw";
+import raymarchClipmapSrc from "../shaders/raymarch_clipmap.wgsl?raw";
 import { Camera } from "./Camera";
 import type { Input } from "./Input";
 
@@ -16,18 +15,23 @@ import type { Input } from "./Input";
 const UNIFORM_FLOATS = 24;
 const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 
-// BrickParams layout: 4 vec4s = 16 floats/u32s = 64 bytes.
-const BRICK_PARAMS_BYTES = 64;
+// ClipmapParams (globals): 3 × vec4 = 48 bytes.
+const CLIPMAP_PARAMS_BYTES = 48;
+// LevelParams: 4 × vec4 = 64 bytes per level.
+const LEVEL_PARAMS_BYTES = 64;
 
-export type RenderMode = "analytic" | "atlas";
+export type RenderMode = "analytic" | "clipmap";
 
 export interface EngineStats {
   sceneRecords: number;
   debugMode: string;
   resolution: [number, number];
   mode: RenderMode;
-  atlasAllocated: number;
-  atlasCapacity: number;
+  clipmapAllocated: number;
+  clipmapCapacity: number;
+  clipmapQueueDepth: number;
+  clipmapLevelCounts: number[];
+  lastBakeMs: number;
 }
 
 interface AnalyticPipeline {
@@ -35,10 +39,10 @@ interface AnalyticPipeline {
   bindGroup: GPUBindGroup;
 }
 
-interface AtlasPipeline {
+interface ClipmapPipeline {
   pipeline: GPURenderPipeline;
   uniformBindGroup: GPUBindGroup;
-  brickBindGroup: GPUBindGroup;
+  clipmapBindGroup: GPUBindGroup;
 }
 
 export class Engine {
@@ -53,24 +57,31 @@ export class Engine {
   private sceneRecords: Record8[] = [];
 
   private analytic: AnalyticPipeline;
-  private atlas: AtlasPipeline | null = null;
+  private clipmapPipeline: ClipmapPipeline | null = null;
 
   private readonly analyticBGL: GPUBindGroupLayout;
-  private readonly atlasUniformBGL: GPUBindGroupLayout;
-  private readonly atlasBrickBGL: GPUBindGroupLayout;
+  private readonly clipmapUniformBGL: GPUBindGroupLayout;
+  private readonly clipmapBGL: GPUBindGroupLayout;
 
   private readonly analyticModule: GPUShaderModule;
-  private readonly atlasModule: GPUShaderModule;
+  private readonly clipmapModule: GPUShaderModule;
 
-  private brickAtlas: BrickAtlas | null = null;
-  private brickParamsBuffer: GPUBuffer | null = null;
+  private clipmap: Clipmap | null = null;
+  private clipmapConfig: ClipmapConfig | null = null;
+  private clipmapParamsBuffer: GPUBuffer | null = null;
+  private levelParamsBuffer: GPUBuffer | null = null;
   private brickMapBuffer: GPUBuffer | null = null;
   private atlasTexture: GPUTexture | null = null;
   private atlasSampler: GPUSampler | null = null;
 
-  private mode: RenderMode = "analytic";
-  private maxSteps = 128;
-  private maxDist = 120;
+  // Per-frame streaming budget.
+  perFrameBrickBudget = 512;
+  lastBakeMs = 0;
+  lastStreamedBricks = 0;
+
+  private mode: RenderMode = "clipmap";
+  private maxSteps = 160;
+  private maxDist = 400;
   private epsilon = 0.001;
   private debugMode: 0 | 1 | 2 = 0;
 
@@ -98,8 +109,8 @@ export class Engine {
     const analyticSrc = [uniformsSrc, sdfOpsSrc, sceneSrc, sharedSrc, raymarchAnalyticSrc].join("\n");
     this.analyticModule = device.createShaderModule({ label: "raymarch.analytic", code: analyticSrc });
 
-    const atlasSrc = [uniformsSrc, brickSrc, sharedSrc, raymarchAtlasSrc].join("\n");
-    this.atlasModule = device.createShaderModule({ label: "raymarch.atlas", code: atlasSrc });
+    const clipmapShader = [uniformsSrc, clipmapSrc, sharedSrc, raymarchClipmapSrc].join("\n");
+    this.clipmapModule = device.createShaderModule({ label: "raymarch.clipmap", code: clipmapShader });
 
     this.analyticBGL = device.createBindGroupLayout({
       label: "analytic.bgl",
@@ -109,19 +120,20 @@ export class Engine {
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     });
-    this.atlasUniformBGL = device.createBindGroupLayout({
-      label: "atlas.uniform.bgl",
+    this.clipmapUniformBGL = device.createBindGroupLayout({
+      label: "clipmap.uniform.bgl",
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
       ],
     });
-    this.atlasBrickBGL = device.createBindGroupLayout({
-      label: "atlas.brick.bgl",
+    this.clipmapBGL = device.createBindGroupLayout({
+      label: "clipmap.bgl",
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       ],
     });
 
@@ -180,74 +192,63 @@ export class Engine {
     const header = new Uint32Array([count, 0, 0, 0]);
     device.queue.writeBuffer(this.sceneHeaderBuffer, 0, header);
     this.sceneRecordCount = count;
-
-    // Re-bake the atlas if we were in atlas mode.
-    if (this.brickAtlas) {
-      this.bakeAtlas(this.sceneRecords);
-    }
   }
 
   /**
-   * Build or rebuild the brick-atlas cache from the current scene. Idempotent.
-   * Call `setMode("atlas")` afterwards to flip the render path.
+   * Create the clipmap and upload its static resources. Call once per scene
+   * change; the per-frame `recenter + flush` runs inside `update()`.
    */
-  bakeAtlas(records: readonly Record8[], opts?: { worldOrigin?: Vec3; worldBricks?: [number, number, number]; atlasSlots?: [number, number, number] }): void {
-    const worldOrigin: Vec3 = opts?.worldOrigin ?? [-8, -2, -8];
-    const worldBricks: [number, number, number] = opts?.worldBricks ?? [16, 8, 16];
-    const atlasSlots: [number, number, number] = opts?.atlasSlots ?? [16, 8, 16];
-
-    const atlas = new BrickAtlas({
-      world: { origin: worldOrigin, size: worldBricks },
-      atlasSlots,
-    });
-    atlas.bake(records);
-    this.brickAtlas = atlas;
+  initClipmap(config?: Partial<ClipmapConfig>): void {
+    const defaults: ClipmapConfig = {
+      baseBrickWorld: 1.0,
+      ringBricks: [16, 8, 16],
+      levels: 6,
+      atlasSlots: [32, 16, 16],
+    };
+    const cfg: ClipmapConfig = { ...defaults, ...config };
+    this.clipmapConfig = cfg;
+    this.clipmap = new Clipmap(cfg);
 
     const { device } = this.gpu;
 
-    // (Re)create the GPU resources.
-    if (this.brickMapBuffer) this.brickMapBuffer.destroy();
-    this.brickMapBuffer = device.createBuffer({
-      label: "brick.map",
-      size: atlas.brickMap.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(this.brickMapBuffer, 0, atlas.brickMap);
-
-    if (!this.brickParamsBuffer) {
-      this.brickParamsBuffer = device.createBuffer({
-        label: "brick.params",
-        size: BRICK_PARAMS_BYTES,
+    if (!this.clipmapParamsBuffer) {
+      this.clipmapParamsBuffer = device.createBuffer({
+        label: "clipmap.params",
+        size: CLIPMAP_PARAMS_BYTES,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }
-    this.writeBrickParams();
+    const levelBytes = LEVEL_PARAMS_BYTES * cfg.levels;
+    if (this.levelParamsBuffer) this.levelParamsBuffer.destroy();
+    this.levelParamsBuffer = device.createBuffer({
+      label: "clipmap.levels",
+      size: levelBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const brickMapBytes =
+      cfg.levels * cfg.ringBricks[0] * cfg.ringBricks[1] * cfg.ringBricks[2] * 4;
+    if (this.brickMapBuffer) this.brickMapBuffer.destroy();
+    this.brickMapBuffer = device.createBuffer({
+      label: "clipmap.brickMap",
+      size: brickMapBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
 
     if (this.atlasTexture) this.atlasTexture.destroy();
     this.atlasTexture = device.createTexture({
-      label: "brick.atlas",
-      size: { width: atlas.atlasSamples[0], height: atlas.atlasSamples[1], depthOrArrayLayers: atlas.atlasSamples[2] },
+      label: "clipmap.atlas",
+      size: {
+        width: this.clipmap.atlasSamples[0],
+        height: this.clipmap.atlasSamples[1],
+        depthOrArrayLayers: this.clipmap.atlasSamples[2],
+      },
       format: "r16float",
       dimension: "3d",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    device.queue.writeTexture(
-      { texture: this.atlasTexture },
-      atlas.atlasData,
-      {
-        bytesPerRow: atlas.atlasSamples[0] * 2,
-        rowsPerImage: atlas.atlasSamples[1],
-      },
-      {
-        width: atlas.atlasSamples[0],
-        height: atlas.atlasSamples[1],
-        depthOrArrayLayers: atlas.atlasSamples[2],
-      },
-    );
-
     if (!this.atlasSampler) {
       this.atlasSampler = device.createSampler({
-        label: "brick.atlasSampler",
+        label: "clipmap.sampler",
         magFilter: "linear",
         minFilter: "linear",
         mipmapFilter: "linear",
@@ -257,81 +258,182 @@ export class Engine {
       });
     }
 
-    // Build atlas pipeline lazily on first use.
-    if (!this.atlas) {
+    this.writeClipmapParams();
+
+    if (!this.clipmapPipeline) {
       const layout = device.createPipelineLayout({
-        label: "atlas.layout",
-        bindGroupLayouts: [this.atlasUniformBGL, this.atlasBrickBGL],
+        label: "clipmap.layout",
+        bindGroupLayouts: [this.clipmapUniformBGL, this.clipmapBGL],
       });
       const pipeline = device.createRenderPipeline({
-        label: "atlas.pipeline",
+        label: "clipmap.pipeline",
         layout,
-        vertex: { module: this.atlasModule, entryPoint: "vs_main" },
-        fragment: { module: this.atlasModule, entryPoint: "fs_main", targets: [{ format: this.gpu.format }] },
+        vertex: { module: this.clipmapModule, entryPoint: "vs_main" },
+        fragment: { module: this.clipmapModule, entryPoint: "fs_main", targets: [{ format: this.gpu.format }] },
         primitive: { topology: "triangle-list" },
       });
       const uniformBindGroup = device.createBindGroup({
-        label: "atlas.uniform.bg",
-        layout: this.atlasUniformBGL,
+        label: "clipmap.uniform.bg",
+        layout: this.clipmapUniformBGL,
         entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
       });
-      const brickBindGroup = device.createBindGroup({
-        label: "atlas.brick.bg",
-        layout: this.atlasBrickBGL,
+      const clipmapBindGroup = device.createBindGroup({
+        label: "clipmap.bg",
+        layout: this.clipmapBGL,
         entries: [
-          { binding: 0, resource: { buffer: this.brickParamsBuffer! } },
-          { binding: 1, resource: { buffer: this.brickMapBuffer! } },
-          { binding: 2, resource: this.atlasTexture.createView() },
-          { binding: 3, resource: this.atlasSampler },
+          { binding: 0, resource: { buffer: this.clipmapParamsBuffer! } },
+          { binding: 1, resource: { buffer: this.levelParamsBuffer } },
+          { binding: 2, resource: { buffer: this.brickMapBuffer } },
+          { binding: 3, resource: this.atlasTexture.createView() },
+          { binding: 4, resource: this.atlasSampler },
         ],
       });
-      this.atlas = { pipeline, uniformBindGroup, brickBindGroup };
+      this.clipmapPipeline = { pipeline, uniformBindGroup, clipmapBindGroup };
     } else {
-      this.atlas.brickBindGroup = device.createBindGroup({
-        label: "atlas.brick.bg",
-        layout: this.atlasBrickBGL,
+      this.clipmapPipeline.clipmapBindGroup = device.createBindGroup({
+        label: "clipmap.bg",
+        layout: this.clipmapBGL,
         entries: [
-          { binding: 0, resource: { buffer: this.brickParamsBuffer! } },
-          { binding: 1, resource: { buffer: this.brickMapBuffer! } },
-          { binding: 2, resource: this.atlasTexture.createView() },
-          { binding: 3, resource: this.atlasSampler! },
+          { binding: 0, resource: { buffer: this.clipmapParamsBuffer! } },
+          { binding: 1, resource: { buffer: this.levelParamsBuffer! } },
+          { binding: 2, resource: { buffer: this.brickMapBuffer! } },
+          { binding: 3, resource: this.atlasTexture.createView() },
+          { binding: 4, resource: this.atlasSampler! },
         ],
       });
     }
   }
 
-  private writeBrickParams(): void {
-    if (!this.brickAtlas || !this.brickParamsBuffer) return;
-    const a = this.brickAtlas;
-    const buf = new ArrayBuffer(BRICK_PARAMS_BYTES);
-    const f = new Float32Array(buf);
+  /**
+   * Populate the clipmap around the camera with a budgeted bake. Call once
+   * after `initClipmap` to pre-warm before the first render.
+   */
+  warmClipmap(maxMs = 50): number {
+    if (!this.clipmap) return 0;
+    const t0 = performance.now();
+    this.clipmap.recenter(this.camera.position);
+    let processed = 0;
+    while (performance.now() - t0 < maxMs && this.clipmap.queueDepth() > 0) {
+      processed += this.clipmap.flush(this.sceneRecords, 256);
+    }
+    this.lastBakeMs = performance.now() - t0;
+    this.uploadClipmapDiffs();
+    return processed;
+  }
+
+  private writeClipmapParams(): void {
+    if (!this.clipmap || !this.clipmapConfig || !this.clipmapParamsBuffer) return;
+    const c = this.clipmap;
+    const cfg = this.clipmapConfig;
+    const buf = new ArrayBuffer(CLIPMAP_PARAMS_BYTES);
     const u = new Uint32Array(buf);
-    // worldOrigin.xyz, w = BRICK_WORLD
-    f[0] = a.world.origin[0];
-    f[1] = a.world.origin[1];
-    f[2] = a.world.origin[2];
-    f[3] = 1.0; // BRICK_WORLD
-    // worldBricks.xyz, w = flag (unused)
-    u[4] = a.world.size[0];
-    u[5] = a.world.size[1];
-    u[6] = a.world.size[2];
-    u[7] = 1;
+    const f = new Float32Array(buf);
+    // levelCount.x
+    u[0] = cfg.levels;
+    u[1] = 0; u[2] = 0; u[3] = 0;
     // atlasSlots.xyz, w = BRICK_SAMPLES
-    u[8] = a.config.atlasSlots[0];
-    u[9] = a.config.atlasSlots[1];
-    u[10] = a.config.atlasSlots[2];
-    u[11] = BRICK_SAMPLES;
-    // atlasTexels.xyz, w = sampleSpacing
-    f[12] = a.atlasSamples[0];
-    f[13] = a.atlasSamples[1];
-    f[14] = a.atlasSamples[2];
-    f[15] = SAMPLE_SPACING;
-    this.gpu.device.queue.writeBuffer(this.brickParamsBuffer, 0, buf);
+    u[4] = cfg.atlasSlots[0]; u[5] = cfg.atlasSlots[1]; u[6] = cfg.atlasSlots[2]; u[7] = BRICK_SAMPLES;
+    // atlasTexels.xyz
+    f[8] = c.atlasSamples[0]; f[9] = c.atlasSamples[1]; f[10] = c.atlasSamples[2]; f[11] = 0;
+    this.gpu.device.queue.writeBuffer(this.clipmapParamsBuffer, 0, buf);
+  }
+
+  /**
+   * Uploads the current level params, brick map, and any dirty atlas slots.
+   * Called after `recenter + flush` each frame.
+   */
+  private uploadClipmapDiffs(): void {
+    if (!this.clipmap || !this.clipmapConfig) return;
+    const { device } = this.gpu;
+
+    // Level params: pack per-level origins, sizes, and brickMap offsets.
+    const cfg = this.clipmapConfig;
+    const ringCount = cfg.ringBricks[0] * cfg.ringBricks[1] * cfg.ringBricks[2];
+    const levelBytes = LEVEL_PARAMS_BYTES * cfg.levels;
+    const levelBuf = new ArrayBuffer(levelBytes);
+    const lf = new Float32Array(levelBuf);
+    const lu = new Uint32Array(levelBuf);
+    const li = new Int32Array(levelBuf);
+    for (let L = 0; L < this.clipmap.levels.length; L++) {
+      const lv = this.clipmap.levels[L]!;
+      const off = (L * LEVEL_PARAMS_BYTES) / 4;
+      // origin.xyz = origin brick * brickWorld, origin.w = brickWorld
+      lf[off + 0] = lv.origin.brick[0] * lv.brickWorld;
+      lf[off + 1] = lv.origin.brick[1] * lv.brickWorld;
+      lf[off + 2] = lv.origin.brick[2] * lv.brickWorld;
+      lf[off + 3] = lv.brickWorld;
+      // info.xyz = ring bricks, w = brickMap offset in u32 words
+      lu[off + 4] = lv.ringBricks[0];
+      lu[off + 5] = lv.ringBricks[1];
+      lu[off + 6] = lv.ringBricks[2];
+      lu[off + 7] = L * ringCount;
+      // originBrick.xyz (i32), w unused
+      li[off + 8] = lv.origin.brick[0];
+      li[off + 9] = lv.origin.brick[1];
+      li[off + 10] = lv.origin.brick[2];
+      li[off + 11] = 0;
+      // sampleSpacing.x, rest pad
+      lf[off + 12] = cfg.baseBrickWorld / (BRICK_SAMPLES - 1) * Math.pow(2, L);
+      lf[off + 13] = 0;
+      lf[off + 14] = 0;
+      lf[off + 15] = 0;
+    }
+    device.queue.writeBuffer(this.levelParamsBuffer!, 0, levelBuf);
+
+    // Brick map: concatenate every level's ring into one buffer in level order.
+    // Cheaper than per-level writes; ≤100 KB even at 6 levels × 16³.
+    const mapBytes = cfg.levels * ringCount * 4;
+    const mapBuf = new ArrayBuffer(mapBytes);
+    const mapU = new Uint32Array(mapBuf);
+    for (let L = 0; L < this.clipmap.levels.length; L++) {
+      const lv = this.clipmap.levels[L]!;
+      mapU.set(lv.brickMap, L * ringCount);
+    }
+    device.queue.writeBuffer(this.brickMapBuffer!, 0, mapBuf);
+
+    // Atlas texture diffs — only slots that changed since last upload.
+    if (this.clipmap.dirtySlots.size > 0 && this.atlasTexture) {
+      for (const slot of this.clipmap.dirtySlots) {
+        this.uploadSlot(slot);
+      }
+      this.clipmap.dirtySlots.clear();
+    }
+  }
+
+  private uploadSlot(slot: number): void {
+    if (!this.clipmap || !this.clipmapConfig || !this.atlasTexture) return;
+    const cfg = this.clipmapConfig;
+    const sx = slot % cfg.atlasSlots[0];
+    const sy = Math.floor(slot / cfg.atlasSlots[0]) % cfg.atlasSlots[1];
+    const sz = Math.floor(slot / (cfg.atlasSlots[0] * cfg.atlasSlots[1]));
+    const ox = sx * BRICK_SAMPLES;
+    const oy = sy * BRICK_SAMPLES;
+    const oz = sz * BRICK_SAMPLES;
+
+    // Copy the brick's 8³ samples out of the flat atlasData buffer.
+    const block = new Uint16Array(new ArrayBuffer(BRICK_SAMPLES * BRICK_SAMPLES * BRICK_SAMPLES * 2));
+    const [atx, aty] = this.clipmap.atlasSamples;
+    for (let z = 0; z < BRICK_SAMPLES; z++) {
+      for (let y = 0; y < BRICK_SAMPLES; y++) {
+        for (let x = 0; x < BRICK_SAMPLES; x++) {
+          const srcIdx = ((oz + z) * aty + (oy + y)) * atx + (ox + x);
+          const dstIdx = (z * BRICK_SAMPLES + y) * BRICK_SAMPLES + x;
+          block[dstIdx] = this.clipmap.atlasData[srcIdx]!;
+        }
+      }
+    }
+    this.gpu.device.queue.writeTexture(
+      { texture: this.atlasTexture, origin: { x: ox, y: oy, z: oz } },
+      block,
+      { bytesPerRow: BRICK_SAMPLES * 2, rowsPerImage: BRICK_SAMPLES },
+      { width: BRICK_SAMPLES, height: BRICK_SAMPLES, depthOrArrayLayers: BRICK_SAMPLES },
+    );
   }
 
   setMode(mode: RenderMode): void {
-    if (mode === "atlas" && !this.atlas) {
-      if (!this.brickAtlas) this.bakeAtlas(this.sceneRecords);
+    if (mode === "clipmap" && !this.clipmap) {
+      this.initClipmap();
+      this.warmClipmap();
     }
     this.mode = mode;
   }
@@ -375,6 +477,14 @@ export class Engine {
     this.camera.update(input, dt);
     const d = input.debug;
     this.debugMode = d === "steps" ? 1 : d === "normals" ? 2 : 0;
+
+    if (this.mode === "clipmap" && this.clipmap) {
+      const t0 = performance.now();
+      this.clipmap.recenter(this.camera.position);
+      this.lastStreamedBricks = this.clipmap.flush(this.sceneRecords, this.perFrameBrickBudget);
+      this.uploadClipmapDiffs();
+      this.lastBakeMs = performance.now() - t0;
+    }
   }
 
   render(): void {
@@ -387,10 +497,10 @@ export class Engine {
         { view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
       ],
     });
-    if (this.mode === "atlas" && this.atlas) {
-      pass.setPipeline(this.atlas.pipeline);
-      pass.setBindGroup(0, this.atlas.uniformBindGroup);
-      pass.setBindGroup(1, this.atlas.brickBindGroup);
+    if (this.mode === "clipmap" && this.clipmapPipeline) {
+      pass.setPipeline(this.clipmapPipeline.pipeline);
+      pass.setBindGroup(0, this.clipmapPipeline.uniformBindGroup);
+      pass.setBindGroup(1, this.clipmapPipeline.clipmapBindGroup);
     } else {
       pass.setPipeline(this.analytic.pipeline);
       pass.setBindGroup(0, this.analytic.bindGroup);
@@ -401,13 +511,17 @@ export class Engine {
   }
 
   stats(): EngineStats {
+    const s = this.clipmap?.stats(this.lastStreamedBricks);
     return {
       sceneRecords: this.sceneRecordCount,
       debugMode: this.debugMode === 0 ? "off" : this.debugMode === 1 ? "steps" : "normals",
       resolution: [this.gpu.canvas.width, this.gpu.canvas.height],
       mode: this.mode,
-      atlasAllocated: this.brickAtlas?.stats.allocated ?? 0,
-      atlasCapacity: this.brickAtlas?.stats.atlasCapacity ?? 0,
+      clipmapAllocated: s?.totalAllocated ?? 0,
+      clipmapCapacity: s?.atlasCapacity ?? 0,
+      clipmapQueueDepth: s?.queueDepth ?? 0,
+      clipmapLevelCounts: s?.perLevelAllocated ?? [],
+      lastBakeMs: this.lastBakeMs,
     };
   }
 }

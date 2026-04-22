@@ -1,7 +1,7 @@
 // CPU mirror of the WGSL scene interpreter in src/shaders/common/scene.wgsl.
-// Used by BrickAtlas allocation to classify and bake bricks without a GPU
-// round-trip. The semantics MUST match the WGSL version exactly — the golden
-// test suite compares their outputs at sample points.
+// Used by the clipmap baker (and the legacy BrickAtlas) to classify and bake
+// bricks without a GPU round-trip. The semantics MUST match the WGSL version
+// exactly — the golden test suite compares their outputs at sample points.
 
 import { OP, type Record8 } from "./Primitives";
 import type { Vec3 } from "../util/math";
